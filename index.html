@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>micro:bit 自動えさやり機設定ツール (Bluetooth版)</title>
+<style>
+body {
+font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+background-color: #f5f7fa;
+color: #333;
+display: flex;
+justify-content: center;
+align-items: center;
+height: 100vh;
+margin: 0;
+}
+.container {
+background-color: #ffffff;
+padding: 30px;
+border-radius: 12px;
+box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+text-align: center;
+width: 350px;
+max-height: 90vh;
+overflow-y: auto;
+}
+h2 {
+margin-top: 0;
+color: #4a5568;
+}
+.status {
+font-size: 0.9em;
+margin-bottom: 20px;
+padding: 8px;
+border-radius: 6px;
+background-color: #edf2f7;
+color: #4a5568;
+}
+.status.connected {
+background-color: #c6f6d5;
+color: #22543d;
+}
+.status.error {
+background-color: #fed7d7;
+color: #742a2a;
+}
+.status.warning {
+background-color: #feebc8;
+color: #7c2d12;
+}
+.log-panel {
+font-size: 0.8em;
+background-color: #f7fafc;
+border: 1px solid #cbd5e0;
+border-radius: 6px;
+padding: 10px;
+margin: 15px 0;
+max-height: 120px;
+overflow-y: auto;
+text-align: left;
+color: #4a5568;
+font-family: 'Courier New', monospace;
+}
+.log-entry {
+margin: 4px 0;
+padding: 2px;
+}
+.log-entry.error {
+color: #c53030;
+}
+.log-entry.success {
+color: #22863a;
+}
+.log-entry.warning {
+color: #bf8700;
+}
+.log-entry.info {
+color: #0366d6;
+}
+button, input[type="time"] {
+width: 100%;
+padding: 12px;
+margin: 10px 0;
+border-radius: 8px;
+border: 1px solid #cbd5e0;
+font-size: 16px;
+box-sizing: border-box;
+}
+button {
+cursor: pointer;
+font-weight: bold;
+transition: background-color 0.2s;
+}
+.btn-connect {
+background-color: #4299e1;
+color: white;
+border: none;
+}
+.btn-connect:hover { background-color: #3182ce; }
+.btn-send {
+background-color: #48bb78;
+color: white;
+border: none;
+}
+.btn-send:hover { background-color: #38a169; }
+button:disabled {
+background-color: #e2e8f0;
+color: #a0aec0;
+cursor: not-allowed;
+}
+input[type="time"]:disabled, input[type="time"][readonly] {
+background-color: #edf2f7;
+color: #718096;
+cursor: not-allowed;
+}
+.button-group {
+display: flex;
+gap: 10px;
+margin-top: 20px;
+}
+.button-group button {
+flex: 1;
+margin: 0;
+}
+.display-panel {
+margin: 10px 0;
+font-size: 0.9em;
+color: #4a5568;
+}
+.display-value {
+font-weight: bold;
+color: #2b6cb0;
+font-size: 1.1em;
+}
+</style>
+</head>
+<body>
+
+<div class="container">
+<h2>micro:bit 自動えさやり機設定ツール</h2>
+<div id="status" class="status">状態: 未接続</div>
+<button id="connectBtn" class="btn-connect">micro:bit とBluetooth接続</button>
+
+<div class="display-panel">
+<span>micro:bitの現在時刻: </span>
+<span id="currentTimeDisp" class="display-value">--:--</span>
+</div>
+
+<div class="display-panel">
+<span>通信ログ:</span>
+<div id="logPanel" class="log-panel">
+<div class="log-entry info">ログはここに表示されます</div>
+</div>
+</div>
+
+<label for="timeInput1" style="display:block; text-align:left; font-size:0.9em; color:#4a5568; margin-bottom: 4px;">micro:bit側の設定タイマー:</label>
+<input type="time" id="timeInput1" value="08:00" disabled>
+
+<hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;">
+
+<label for="timeInput2" style="display:block; text-align:left; font-size:0.9em; color:#718096;">送信する時刻を選択:</label>
+<input type="time" id="timeInput2" value="12:00" disabled>
+
+<button id="sendBtn" class="btn-send" disabled>えさやり時刻を送信</button>
+
+<div class="button-group">
+<button id="esayari" class="btn-send" disabled>えさやり</button>
+<button id="teishi" class="btn-send" disabled style="background-color: #ed8936;">強制停止</button>
+</div>
+</div>
+
+<script>
+// micro:bit BLE UART サービスのUUID群
+const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const TX_CHARACTERISTIC_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // アプリが受信（micro:bit送信）
+const RX_CHARACTERISTIC_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // アプリが送信（micro:bit受信）
+
+// バッファサイズ制限とログ制限
+const MAX_BUFFER_SIZE = 1024;
+const MAX_LOG_ENTRIES = 20;
+const CHARACTERISTIC_RETRY_DELAY = 500; // キャラクタリスティック取得のリトライ遅延
+
+let bluetoothDevice = null;
+let txCharacteristic = null;
+let rxCharacteristic = null;
+let receiveBuffer = '';
+let isConnected = false;
+let logEntries = [];
+
+const connectBtn = document.getElementById('connectBtn');
+const sendBtn = document.getElementById('sendBtn');
+const esayari = document.getElementById('esayari');
+const teishi = document.getElementById('teishi');
+const timeInput1 = document.getElementById('timeInput1');
+const timeInput2 = document.getElementById('timeInput2');
+const statusDiv = document.getElementById('status');
+const currentTimeDisp = document.getElementById('currentTimeDisp');
+const logPanel = document.getElementById('logPanel');
+
+// ステータス更新ヘルパー関数
+function updateStatus(message, type = 'neutral') {
+  statusDiv.textContent = `状態: ${message}`;
+  statusDiv.classList.remove('connected', 'error', 'warning');
+  if (type === 'connected') {
+    statusDiv.classList.add('connected');
+  } else if (type === 'error') {
+    statusDiv.classList.add('error');
+  } else if (type === 'warning') {
+    statusDiv.classList.add('warning');
+  }
+}
+
+// ログを追加する関数
+function addLog(message, type = 'info') {
+  const timestamp = new Date().toLocaleTimeString('ja-JP');
+  const entry = `[${timestamp}] ${message}`;
+  logEntries.push({ text: entry, type });
+
+  if (logEntries.length > MAX_LOG_ENTRIES) {
+    logEntries.shift();
+  }
+
+  updateLogDisplay();
+  console.log(`[${type.toUpperCase()}] ${message}`);
+}
+
+// ログ表示を更新する関数
+function updateLogDisplay() {
+  logPanel.innerHTML = '';
+  logEntries.forEach(entry => {
+    const div = document.createElement('div');
+    div.className = `log-entry ${entry.type}`;
+    div.textContent = entry.text;
+    logPanel.appendChild(div);
+  });
+  logPanel.scrollTop = logPanel.scrollHeight;
+}
+
+// ブラウザの Web Bluetooth サポートチェック
+if (!navigator.bluetooth) {
+  updateStatus('このブラウザは Web Bluetooth に対応していません', 'error');
+  addLog('Web Bluetooth非対応ブラウザ', 'error');
+  connectBtn.disabled = true;
+}
+
+// キャラクタリスティック取得のリトライ関数
+async function getCharacteristicWithRetry(service, characteristicUUID, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await service.getCharacteristic(characteristicUUID);
+    } catch (error) {
+      if (i < maxRetries - 1) {
+        addLog(`キャラクタリスティック取得リトライ (${i + 1}/${maxRetries - 1})`, 'warning');
+        await new Promise(resolve => setTimeout(resolve, CHARACTERISTIC_RETRY_DELAY));
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
+// 接続・切断の切り替え
+connectBtn.addEventListener('click', async () => {
+  if (!navigator.bluetooth) return;
+
+  if (bluetoothDevice && bluetoothDevice.gatt && bluetoothDevice.gatt.connected) {
+    disconnect();
+    return;
+  }
+
+  try {
+    updateStatus("デバイスを探しています...", 'neutral');
+    addLog("Bluetoothデバイス検索開始", 'info');
+
+    try {
+      bluetoothDevice = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: 'BBC micro:bit' }],
+        optionalServices: [UART_SERVICE_UUID]
+      });
+      addLog(`デバイス見つかりました: ${bluetoothDevice.name}`, 'success');
+    } catch (firstErr) {
+      if (firstErr.name === 'NotFoundError') {
+        addLog("フィルタ検索でデバイスが見つかりません", 'warning');
+        const tryAll = confirm('指定のデバイス名が見つかりませんでした。全てのデバイスから選択しますか？(micro:bit を選択してください)');
+        if (!tryAll) {
+          addLog("ユーザーがキャンセルしました", 'info');
+          updateStatus("キャンセルしました", 'neutral');
+          return;
+        }
+        bluetoothDevice = await navigator.bluetooth.requestDevice({
+          acceptAllDevices: true,
+          optionalServices: [UART_SERVICE_UUID]
+        });
+        addLog(`デバイス見つかりました: ${bluetoothDevice.name}`, 'success');
+      } else if (firstErr.name === 'SecurityError') {
+        addLog("セキュリティエラー: ユーザーが接続を拒否しました", 'warning');
+        updateStatus("キャンセルしました", 'neutral');
+        return;
+      } else {
+        throw firstErr;
+      }
+    }
+
+    updateStatus("接続中...", 'neutral');
+    addLog("GATT接続開始", 'info');
+    const server = await bluetoothDevice.gatt.connect();
+    addLog("GATT接続成功", 'success');
+    
+    await new Promise(resolve => setTimeout(resolve, 300));
+    
+    let service;
+    try {
+      service = await server.getPrimaryService(UART_SERVICE_UUID);
+      addLog("UARTサービス取得成功", 'success');
+    } catch (error) {
+      console.error("UARTサービス取得エラー:", error);
+      addLog(`UARTサービス取得失敗: ${error.message}`, 'error');
+      throw new Error("UART サービスが見つかりません。プログラムを確認してください");
+    }
+
+    try {
+      txCharacteristic = await getCharacteristicWithRetry(service, TX_CHARACTERISTIC_UUID);
+      rxCharacteristic = await getCharacteristicWithRetry(service, RX_CHARACTERISTIC_UUID);
+      addLog("キャラクタリスティック取得成功", 'success');
+    } catch (error) {
+      console.error("キャラクタリスティク取得エラー:", error);
+      addLog(`キャラクタリスティック取得失敗: ${error.message}`, 'error');
+      throw new Error("必要なBluetoothキャラクタリスティクが見つかりません");
+    }
+
+    try {
+      await txCharacteristic.startNotifications();
+      txCharacteristic.addEventListener('characteristicvaluechanged', handleDataReceived);
+      addLog("通知機能開始成功", 'success');
+    } catch (error) {
+      console.error("Notification開始エラー:", error);
+      addLog(`通知機能開始失敗: ${error.message}`, 'error');
+      throw new Error("通知機能の開始に失敗しました");
+    }
+
+    bluetoothDevice.removeEventListener('gattserverdisconnected', onDisconnected);
+    bluetoothDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+    // UI状態の更新
+    isConnected = true;
+    connectBtn.textContent = "接続解除";
+    sendBtn.disabled = false;
+    esayari.disabled = false;
+    teishi.disabled = false;
+    timeInput2.disabled = false;
+
+    // 接続直後に初期データを要求（削り・シンプル化した部分）
+    updateStatus("Bluetooth接続済み", 'connected');
+    addLog("SYNCコマンド送信", 'info');
+    await sendData('SYNC\n');
+
+  } catch (error) {
+    console.error("Bluetooth接続エラー:", error);
+    addLog(`接続失敗: ${error.message}`, 'error');
+    updateStatus(`接続失敗: ${error.message}`, 'error');
+    resetUI();
+  }
+});
+
+// データの送信関数
+async function sendData(stringData) {
+  if (!rxCharacteristic) {
+    const errMsg = "rxCharacteristicが初期化されていません";
+    console.error(errMsg);
+    addLog(errMsg, 'error');
+    throw new Error("Bluetoothが接続されていません");
+  }
+  try {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(stringData);
+    
+    try {
+      await rxCharacteristic.writeValueWithoutResponse(data);
+    } catch (e) {
+      await rxCharacteristic.writeValue(data);
+    }
+    
+    addLog(`送信成功: ${stringData.trim()}`, 'success');
+  } catch (error) {
+    console.error("送信エラー:", error);
+    const errMsg = `送信失敗: ${error.message}`;
+    addLog(errMsg, 'error');
+    updateStatus(errMsg, 'error');
+    throw error;
+  }
+}
+
+// 各ボタンのイベント処理
+sendBtn.addEventListener('click', async () => {
+  const timeVal = timeInput2.value;
+  if (!timeVal) {
+    updateStatus("時刻を入力してください", 'error');
+    addLog("時刻が入力されていません", 'error');
+    return;
+  }
+
+  if (!/^\d{2}:\d{2}$/.test(timeVal)) {
+    updateStatus("時刻形式が無効です", 'error');
+    addLog(`無効な時刻形式: ${timeVal}`, 'error');
+    return;
+  }
+
+  const fourDigitTime = timeVal.replace(':', '');
+  try {
+    await sendData(fourDigitTime + '\n');
+    updateStatus(`時刻送信済み: ${fourDigitTime}`, 'connected');
+    addLog(`えさやり時刻送信: ${timeVal}`, 'success');
+    setTimeout(() => {
+      if (bluetoothDevice && bluetoothDevice.gatt && bluetoothDevice.gatt.connected) {
+        updateStatus("Bluetooth接続済み", 'connected');
+      }
+    }, 2000);
+  } catch (error) {
+    console.error("送信エラー:", error);
+  }
+});
+
+esayari.addEventListener('click', async () => {
+  try {
+    await sendData('FEED\n');
+    updateStatus("えさやりコマンド送信済み", 'connected');
+    addLog("FEEDコマンド送信", 'success');
+    setTimeout(() => {
+      if (bluetoothDevice && bluetoothDevice.gatt && bluetoothDevice.gatt.connected) {
+        updateStatus("Bluetooth接続済み", 'connected');
+      }
+    }, 2000);
+  } catch (error) {
+    console.error("送信エラー:", error);
+  }
+});
+
+teishi.addEventListener('click', async () => {
+  try {
+    await sendData('STOP\n');
+    updateStatus("強制停止コマンド送信済み", 'connected');
+    addLog("STOPコマンド送信", 'success');
+    setTimeout(() => {
+      if (bluetoothDevice && bluetoothDevice.gatt && bluetoothDevice.gatt.connected) {
+        updateStatus("Bluetooth接続済み", 'connected');
+      }
+    }, 2000);
+  } catch (error) {
+    console.error("送信エラー:", error);
+  }
+});
+
+// データ受信時の処理
+function handleDataReceived(event) {
+  const value = event.target.value;
+  const decoder = new TextDecoder();
+  const text = decoder.decode(value);
+
+  receiveBuffer += text;
+
+  if (receiveBuffer.length > MAX_BUFFER_SIZE) {
+    const warnMsg = `バッファサイズ超過（${receiveBuffer.length}bytes）。クリアします。`;
+    addLog(warnMsg, 'error');
+    updateStatus("データ受信エラー（バッファ超過）", 'error');
+    receiveBuffer = '';
+    return;
+  }
+
+  if (receiveBuffer.includes('\n') || receiveBuffer.includes('\r')) {
+    const lines = receiveBuffer.split(/\r?\n/);
+    receiveBuffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (trimmedLine !== "") {
+        processReceivedData(trimmedLine);
+      }
+    }
+  }
+}
+
+// 受信した数値を判定してUIに反映する関数
+function processReceivedData(data) {
+  if (!data || typeof data !== 'string') {
+    addLog(`受信データ形式エラー: ${data}`, 'warning');
+    return;
+  }
+
+  const num = parseInt(data, 10);
+  if (isNaN(num)) {
+    addLog(`受信データ: ${data} （数値以外、スキップ）`, 'warning');
+    return;
+  }
+
+  if (num >= 10000) {
+    const timeNum = num - 10000;
+    currentTimeDisp.textContent = formatToTimeString(timeNum);
+    addLog(`現在時刻受信: ${formatToTimeString(timeNum)}`, 'info');
+    updateStatus("Bluetooth接続済み", 'connected');
+  } else {
+    const formattedTime = formatToTimeString(num);
+    timeInput1.value = formattedTime;
+    addLog(`設定タイマー受信: ${formattedTime}`, 'info');
+  }
+}
+
+function formatToTimeString(num) {
+  const str = num.toString().padStart(4, '0');
+  const hours = str.slice(0, 2);
+  const minutes = str.slice(2, 4);
+  return `${hours}:${minutes}`;
+}
+
+function disconnect() {
+  if (bluetoothDevice && bluetoothDevice.gatt && bluetoothDevice.gatt.connected) {
+    bluetoothDevice.gatt.disconnect();
+    addLog("手動切断実行", 'info');
+  }
+}
+
+function onDisconnected() {
+  addLog("Bluetooth接続が切断されました", 'warning');
+  resetUI();
+}
+
+function resetUI() {
+  try {
+    if (bluetoothDevice) {
+      bluetoothDevice.removeEventListener('gattserverdisconnected', onDisconnected);
+    }
+  } catch (e) { /* ignore */ }
+
+  try {
+    if (txCharacteristic) {
+      txCharacteristic.removeEventListener('characteristicvaluechanged', handleDataReceived);
+    }
+  } catch (e) { /* ignore */ }
+
+  bluetoothDevice = null;
+  txCharacteristic = null;
+  rxCharacteristic = null;
+  receiveBuffer = '';
+  isConnected = false;
+
+  updateStatus('未接続', 'neutral');
+  currentTimeDisp.textContent = "--:--";
+  connectBtn.textContent = "micro:bit とBluetooth接続";
+  sendBtn.disabled = true;
+  esayari.disabled = true;
+  teishi.disabled = true;
+  timeInput2.disabled = true;
+}
+</script>
+</body>
+</html>
